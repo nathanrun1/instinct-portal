@@ -1,0 +1,49 @@
+# systemd unit for the Instinct Portal.
+#
+# Install:
+#   sudo cp deploy/instinct-portal.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now instinct-portal
+# Logs:
+#   journalctl -u instinct-portal -f
+#
+# Expects the code and its .venv in /opt/instinct-portal and public keys in
+# /etc/instinct-portal/keys. Runs as a throwaway unprivileged user that cannot
+# read /home, so the venv's Python must also live outside /home.
+
+[Unit]
+Description=Instinct Portal JSON-RPC endpoint
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/opt/instinct-portal/.venv/bin/python /opt/instinct-portal/src/main.py \
+    --host 127.0.0.1 --port 8000 \
+    --keys-dir /etc/instinct-portal/keys \
+    --db /var/lib/instinct-portal/used.sqlite
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+Restart=on-failure
+RestartSec=2
+
+# Unprivileged user created per run; /var/lib/instinct-portal is its writable state dir.
+DynamicUser=yes
+StateDirectory=instinct-portal
+
+# Hardening: limits what a compromise of this internet-facing process can reach.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target
