@@ -14,8 +14,10 @@ Expose it publicly through an HTTPS tunnel, e.g.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import logging
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -29,6 +31,14 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from rpc import (
+    INTERNAL_ERROR,
+    INVALID_REQUEST,
+    METHOD_NOT_FOUND,
+    PARSE_ERROR,
+    UNAUTHORIZED,
+    RpcError,
+)
 from tokens import (
     DEFAULT_KEYS_DIR,
     PROJECT_ROOT,
@@ -39,18 +49,14 @@ from tokens import (
     parse_token,
     verify_signature,
 )
+from vault import Vault
 
 log = logging.getLogger("portal")
 
 DEFAULT_DB = PROJECT_ROOT / "data" / "used.sqlite"
+DEFAULT_VAULT_URL = "http://127.0.0.1:8080"
 MAX_BODY_BYTES = 1_000_000
-
-# JSON-RPC 2.0 error codes
-PARSE_ERROR = -32700
-INVALID_REQUEST = -32600
-METHOD_NOT_FOUND = -32601
-INTERNAL_ERROR = -32603
-UNAUTHORIZED = -32001  # implementation-defined server error range
+MAX_LOGGED_PAYLOAD = 2000  # characters; keeps note contents from flooding the log
 
 
 # --- key store --------------------------------------------------------------
@@ -160,7 +166,10 @@ def ping(params: Any) -> str:
     return "pong"
 
 
-METHODS: dict[str, Callable[[Any], Any]] = {
+# Handlers take the request's params and return a result (or an awaitable of
+# one), or raise RpcError.
+Methods = dict[str, Callable[[Any], Any]]
+BASE_METHODS: Methods = {
     "ping": ping,
 }
 
@@ -206,7 +215,30 @@ async def read_body(request: Request, limit: int) -> bytes | None:
     return b"".join(chunks)
 
 
-def create_app(keys: KeyStore, uses: UseStore) -> Starlette:
+async def dispatch(methods: Methods, msg: dict, jti: str) -> dict:
+    id_ = msg.get("id")
+    handler = methods.get(msg["method"])
+    if handler is None:
+        return rpc_error(id_, METHOD_NOT_FOUND, "method not found")
+    try:
+        result = handler(msg.get("params"))
+        if inspect.isawaitable(result):
+            result = await result
+    except RpcError as e:
+        detail = "" if e.data is None else " " + truncate(json.dumps(e.data, ensure_ascii=False), 300)
+        log.info("jti=%s %s error %d: %s%s", jti, msg["method"], e.code, e.message, detail)
+        return rpc_error(id_, e.code, e.message, e.data)
+    except Exception:
+        log.exception("jti=%s handler %s failed", jti, msg["method"])
+        return rpc_error(id_, INTERNAL_ERROR, "internal error")
+    return {"jsonrpc": "2.0", "id": id_, "result": result}
+
+
+def truncate(text: str, limit: int) -> str:
+    return text if len(text) <= limit else f"{text[:limit]}... [{len(text) - limit} more chars]"
+
+
+def create_app(keys: KeyStore, uses: UseStore, methods: Methods) -> Starlette:
     async def rpc(request: Request) -> Response:
         now = int(time.time())
         try:
@@ -230,29 +262,32 @@ def create_app(keys: KeyStore, uses: UseStore) -> Starlette:
             log.info("jti=%s unparseable payload: %r", claims.jti, body[:500])
             return JSONResponse(rpc_error(None, PARSE_ERROR, "parse error"))
 
-        log.info("jti=%s payload: %s", claims.jti, json.dumps(msg, separators=(",", ":")))
+        payload = json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
+        log.info("jti=%s payload: %s", claims.jti, truncate(payload, MAX_LOGGED_PAYLOAD))
 
         reason = invalid_reason(msg)
         if reason:
             id_ = msg.get("id") if isinstance(msg, dict) and valid_id(msg.get("id")) else None
             return JSONResponse(rpc_error(id_, INVALID_REQUEST, "invalid request", reason))
 
-        is_notification = "id" not in msg
-        handler = METHODS.get(msg["method"])
-        if handler is None:
-            response = rpc_error(msg.get("id"), METHOD_NOT_FOUND, "method not found")
-        else:
-            try:
-                response = {"jsonrpc": "2.0", "id": msg.get("id"), "result": handler(msg.get("params"))}
-            except Exception:
-                log.exception("jti=%s handler %s failed", claims.jti, msg["method"])
-                response = rpc_error(msg.get("id"), INTERNAL_ERROR, "internal error")
-
-        if is_notification:
+        response = await dispatch(methods, msg, claims.jti)
+        if "id" not in msg:  # notification: run it, return nothing
             return Response(status_code=204)
         return JSONResponse(response)
 
     return Starlette(routes=[Route("/rpc", rpc, methods=["POST"])])
+
+
+def find_vault_token_file(explicit: Path | None) -> Path | None:
+    """--vault-token-file if given, else systemd's LoadCredential=vault-token:..."""
+    if explicit is not None:
+        if not explicit.is_file():
+            raise SystemExit(f"--vault-token-file {explicit} does not exist")
+        return explicit
+    creds = os.environ.get("CREDENTIALS_DIRECTORY")
+    if creds and (Path(creds) / "vault-token").is_file():
+        return Path(creds) / "vault-token"
+    return None
 
 
 def main() -> None:
@@ -261,9 +296,15 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--keys-dir", type=Path, default=DEFAULT_KEYS_DIR)
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
+    parser.add_argument("--vault-url", default=DEFAULT_VAULT_URL,
+                        help=f"vault sync server on this machine (default {DEFAULT_VAULT_URL})")
+    parser.add_argument("--vault-token-file", type=Path,
+                        help="file holding the sync server device token; defaults to the systemd "
+                             "credential 'vault-token' if present. Without a token, vault.* is disabled.")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # per-request lines duplicate the payload log
 
     keys = KeyStore(args.keys_dir)
     keys.scan()
@@ -277,7 +318,15 @@ def main() -> None:
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         log.warning("binding %s directly: bearer tokens travel unencrypted without a TLS proxy", args.host)
 
-    app = create_app(keys, UseStore(args.db))
+    methods = dict(BASE_METHODS)
+    token_file = find_vault_token_file(args.vault_token_file)
+    if token_file is None:
+        log.info("vault.* disabled: no vault token file")
+    else:
+        methods.update(Vault(args.vault_url, token_file.read_text().strip()).methods())
+        log.info("vault.* enabled: sync server at %s", args.vault_url)
+
+    app = create_app(keys, UseStore(args.db), methods)
     uvicorn.run(app, host=args.host, port=args.port, log_config=None, server_header=False)
 
 

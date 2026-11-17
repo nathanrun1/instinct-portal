@@ -9,6 +9,8 @@ The instructions for the agent itself are in [docs/instinct-agent.md](docs/insti
 | Path | Purpose |
 |---|---|
 | `src/main.py` | The server. Serves `POST /rpc`. Holds public keys only. |
+| `src/vault.py` | `vault.*` methods: read/write access to an Obsidian vault through a sync server on the same machine. |
+| `src/rpc.py` | JSON-RPC error codes and the `RpcError` exception that methods raise. |
 | `src/keygen.py` | Generates an ed25519 key pair. |
 | `src/mint.py` | Signs tokens with a private key. |
 | `src/tokens.py` | Token format and key-file naming, shared by the three scripts above. |
@@ -88,7 +90,64 @@ curl localhost:8000/rpc -H "Authorization: Bearer $T" \
 # {"jsonrpc":"2.0","id":1,"result":"pong"}
 ```
 
-Server options: `--host`, `--port`, `--keys-dir`, `--db`. Keep `--host` at `127.0.0.1` and put HTTPS in front with a tunnel; tokens sent over plain HTTP can be read in transit.
+Server options: `--host`, `--port`, `--keys-dir`, `--db`, `--vault-url`, `--vault-token-file`. Keep `--host` at `127.0.0.1` and put HTTPS in front with a tunnel; tokens sent over plain HTTP can be read in transit.
+
+## Vault connector
+
+The `vault.*` methods give the agent read/write access to an Obsidian vault through a [Self-Hosted Vault Sync](https://github.com/PeoneEr/self-hosted-vault-sync-server) server. The sync server must run on the same machine as the portal, at `http://127.0.0.1:8080` by default (`--vault-url` changes it). The methods are enabled only when the portal has a device token for the sync server; without one they return "method not found".
+
+| Method | What it does |
+|---|---|
+| `vault.list` | Lists files, optionally under a path prefix. Rebuilt from the sync server's changelog, since the server has no listing endpoint. |
+| `vault.read` | Returns a file's content and hash. |
+| `vault.write` | Creates a file, or overwrites one whose current hash matches `base_hash`. |
+| `vault.delete` | Deletes a file whose current hash matches `base_hash`. |
+| `vault.changes` | Returns changelog entries after a timestamp. |
+
+Agent-facing details are in [docs/instinct-agent.md](docs/instinct-agent.md).
+
+What the portal adds on top of the sync server:
+
+- **Writes can't overwrite unseen edits.** Overwriting or deleting needs the hash from a read. The portal checks it before writing, so a stale write is rejected instead of being stored as a conflict copy that syncs to every device.
+- **Hidden paths are blocked.** Any path with a part starting with `.` (such as `.obsidian/`) can't be listed, read or written. Plugin code and settings live there, including the sync plugin's own device token, and a plugin written there would run on every synced device.
+- **Device management is not exposed.** `/pair` would let the agent create permanent device tokens; revoking could lock out your own devices. The `/events` stream is not exposed either.
+- **Reads are capped at 1 MB** per file. Writes are capped by the portal's 1 MB request limit.
+
+The sync server's device tokens have no read-only mode, so the portal's token has full vault access. The restrictions above are what limit the agent.
+
+### Give the portal a device token
+
+Create a dedicated device for the portal, so it can be revoked on its own. `/pair` needs an existing device token: the bootstrap token from the sync server's first start, or the token in any device's plugin settings.
+
+```sh
+curl -s -X POST http://127.0.0.1:8080/pair \
+  -H "Authorization: Bearer <existing-device-token>" \
+  -d '{"label": "instinct-portal"}'
+# {"id":"dev_...","token":"<new token>"}
+```
+
+Save the new token where the service reads it, readable only by root:
+
+```sh
+sudo sh -c 'umask 077; cat > /etc/instinct-portal/vault-token'   # paste the token, press Enter, then Ctrl-D
+sudo systemctl restart instinct-portal
+journalctl -u instinct-portal -b | grep vault                     # expect "vault.* enabled"
+```
+
+The unit file passes it to the service with `LoadCredential`. For a local run, use `--vault-token-file PATH` instead.
+
+To cut the portal off from the vault, revoke its device in the sync server's admin UI or with `DELETE /devices/<id>`, using the `id` that `/pair` returned.
+
+### Bind the sync server to localhost
+
+The sync server's `docker-compose.yml` publishes `"8080:8080"`, which listens on every network interface. Docker's published ports also bypass `ufw`, so the server is reachable over plain HTTP from any network the laptop joins. Tailscale Serve and the portal both connect over localhost, so change the mapping to:
+
+```yaml
+    ports:
+      - "127.0.0.1:8080:8080"
+```
+
+Then run `docker compose up -d`, and check with `ss -ltn | grep 8080`: it should show `127.0.0.1:8080`, not `0.0.0.0:8080` or `*:8080`.
 
 ## Running as a service (Ubuntu)
 
@@ -191,6 +250,10 @@ ssh laptop 'cd /opt/instinct-portal && UV_PYTHON_INSTALL_DIR=/opt/instinct-porta
 |---|---|
 | `status=203/EXEC` | systemd could not run the interpreter. Usually `.venv/bin/python` links into `/home`; see step 2. Otherwise check permissions with `namei -l "$(readlink -f /opt/instinct-portal/.venv/bin/python)"`: every directory needs `x` for others. |
 | `status=31/SYS` | A system call was blocked by `SystemCallFilter` in the unit file. |
+| `status=243/CREDENTIALS` | `/etc/instinct-portal/vault-token` is missing. Create it (see "Vault connector"), or delete the `LoadCredential` line to run without the vault. |
+| `vault.*` returns `-32601` | The portal has no vault token. Check for `vault.* disabled` in the journal. |
+| `vault.*` returns `-32010` "rejected the portal's device token" | The token in `/etc/instinct-portal/vault-token` is wrong or its device was revoked. Pair a new one. |
+| `vault.*` returns `-32010` "unreachable" | The sync server is down, or not at `--vault-url`. Check `curl -s -o /dev/null -w '%{http_code}' 127.0.0.1:8080/changes` (expect `401`). If that works but the portal still can't connect, the unit's `IPAddressDeny` may be blocking Docker's port forwarding: the journal entry's `data` field shows the error. |
 | Every request returns `unknown_key` | No valid `.public.pem` in `/etc/instinct-portal/keys`, or the token was signed by a key that is not there. |
 | Every request returns `key_expired` | Generate a new key. |
 

@@ -30,6 +30,18 @@ RestartSec=2
 DynamicUser=yes
 StateDirectory=instinct-portal
 
+# Device token for the vault sync server (README: "Vault connector"). systemd
+# copies the root-only file into a directory only this service can read. The
+# service fails with status=243/CREDENTIALS if the file is missing; delete
+# this line to run without the vault.* methods.
+LoadCredential=vault-token:/etc/instinct-portal/vault-token
+
+# Network: localhost only. Funnel delivers requests from tailscaled over
+# localhost and the sync server is on localhost, so nothing else is needed,
+# and a compromised process cannot send the vault token anywhere.
+IPAddressAllow=localhost
+IPAddressDeny=any
+
 # Hardening: limits what a compromise of this internet-facing process can reach.
 NoNewPrivileges=yes
 ProtectSystem=strict
